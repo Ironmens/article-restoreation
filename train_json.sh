@@ -1,0 +1,15 @@
+torchrun --nnodes=1 --nproc_per_node=2 train.py \
+	--image_dir_path images/ \
+	--output_dir output/ \
+	--json_file images.json \
+	--draw_box \
+	--lr 5e-3 \
+	--max_window_size 15 \
+	--per_image_iteration 7 \
+	--epochs 1 \
+	--num_workers 8 \
+	--seed 42 \
+	--pin_mem \
+	--point_number 6 \
+	--batch_size 1 \
+	--save_path checkpoints/ 
