@@ -5,8 +5,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-import math
-
+from .auxilary import *
 
 class Bottleneck(nn.Module):
     expansion = 4
@@ -68,7 +67,7 @@ class AttentionPool2d(nn.Module):
         x = x.reshape(x.shape[0], x.shape[1], x.shape[2] * x.shape[3]).permute(2, 0, 1)  # NCHW -> (HW)NC
         x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (HW+1)NC
         x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC
-        x, _ = F.multi_head_attention_forward(
+        x, _ = multi_head_attention_forward(
             query=x, key=x, value=x,
             embed_dim_to_check=x.shape[-1],
             num_heads=self.num_heads,
@@ -169,7 +168,7 @@ class ResidualAttentionBlock(nn.Module):
     def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
         super().__init__()
 
-        self.attn = nn.MultiheadAttention(d_model, n_head)
+        self.attn = MultiheadAttention(d_model, n_head)
         self.ln_1 = LayerNorm(d_model)
         self.mlp = nn.Sequential(OrderedDict([
             ("c_fc", nn.Linear(d_model, d_model * 4)),
@@ -179,9 +178,19 @@ class ResidualAttentionBlock(nn.Module):
         self.ln_2 = LayerNorm(d_model)
         self.attn_mask = attn_mask
 
+        self.attn_probs = None
+        self.attn_grad = None
+
+    def set_attn_probs(self, attn_probs):
+        self.attn_probs = attn_probs
+
+    def set_attn_grad(self, attn_grad):
+        self.attn_grad = attn_grad
+
     def attention(self, x: torch.Tensor):
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
-        return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
+        return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask, attention_probs_forward_hook=self.set_attn_probs,
+                         attention_probs_backwards_hook=self.set_attn_grad)[0]
 
     def forward(self, x: torch.Tensor):
         x = x + self.attention(self.ln_1(x))
@@ -200,7 +209,7 @@ class Transformer(nn.Module):
         return self.resblocks(x)
 
 
-class VisionTransformer(nn.Module):
+class VisualTransformer(nn.Module):
     def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int):
         super().__init__()
         self.input_resolution = input_resolution
@@ -217,67 +226,24 @@ class VisionTransformer(nn.Module):
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
-    # https://github.com/facebookresearch/dino
-    def interpolate_pos_encoding(self, x, w, h):
-        positional_embedding = self.positional_embedding.unsqueeze(0)
-        patch_size = self.conv1.kernel_size[0]
-
-        npatch = x.shape[1] - 1
-        N = positional_embedding.shape[1] - 1
-        if npatch == N and w == h:
-            return positional_embedding
-        class_pos_embed = positional_embedding[:, 0]
-        patch_pos_embed = positional_embedding[:, 1:]
-        dim = x.shape[-1]
-
-        w0 = w // patch_size
-        h0 = h // patch_size
-
-        # we add a small number to avoid floating point error in the interpolation
-        # see discussion at https://github.com/facebookresearch/dino/issues/8
-        w0, h0 = w0 + 0.1, h0 + 0.1
-        patch_pos_embed = nn.functional.interpolate(
-            patch_pos_embed.reshape(1, int(math.sqrt(N)), int(math.sqrt(N)), dim).permute(0, 3, 1, 2),
-            scale_factor=(w0 / math.sqrt(N), h0 / math.sqrt(N)),
-            mode='bicubic',
-        )
-        assert int(w0) == patch_pos_embed.shape[-2] and int(h0) == patch_pos_embed.shape[-1]
-        patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
-        return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1)
-
     def forward(self, x: torch.Tensor):
-        x = self.transformer_first_blocks_forward(x)
-        x = self.transformer.resblocks[-1](x)
+        x = self.conv1(x)  # shape = [*, width, grid, grid]
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
+        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
+        x = x + self.positional_embedding.to(x.dtype)
+        x = self.ln_pre(x)
+
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
+
         x = self.ln_post(x[:, 0, :])
 
         if self.proj is not None:
             x = x @ self.proj
 
         return x
-
-    def transformer_first_blocks_forward(self, x):
-        h, w = x.shape[-2:]
-        x = self.conv1(x)  # shape = [*, width, grid, grid]
-        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
-        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
-        x = torch.cat(
-            [self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device),
-             x], dim=1)  # shape = [*, grid ** 2 + 1, width]
-        positional_embedding = self.interpolate_pos_encoding(x, w, h)
-        x = x + positional_embedding.to(x.dtype)
-        # x = x + self.positional_embedding.to(x.dtype)
-        x = self.ln_pre(x)
-        x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer.resblocks[:-1](x)
-        return x
-
-    @staticmethod
-    def attn_cosine_sim(x, eps=1e-08):
-        norm = x.norm(dim=2, keepdim=True)
-        factor = torch.clamp(norm @ norm.permute(0, 2, 1), min=eps)  # shape [1, t, t]
-        sim_matrix = (x @ x.permute(0, 2, 1)) / factor  # shape [1, t, t]
-        return sim_matrix
 
 
 class CLIP(nn.Module):
@@ -310,7 +276,7 @@ class CLIP(nn.Module):
             )
         else:
             vision_heads = vision_width // 64
-            self.visual = VisionTransformer(
+            self.visual = VisualTransformer(
                 input_resolution=image_resolution,
                 patch_size=vision_patch_size,
                 width=vision_width,
@@ -377,18 +343,12 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def calculate_self_sim(self, x: torch.Tensor):
-        tokens = self.visual.transformer_first_blocks_forward(
-            x.type(self.dtype))  # shape = [batch, tokens, emb_dim] tokens include class token
-        tokens = tokens.permute(1, 0, 2) ## [tokens, batch, emb_dim]
-        ssim = self.visual.attn_cosine_sim(tokens)  # shape = [batch, tokens, tokens]
-        return ssim
-
     def encode_image(self, image):
         return self.visual(image.type(self.dtype))
 
     def encode_text(self, text):
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
+
         x = x + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.transformer(x)
@@ -412,7 +372,7 @@ class CLIP(nn.Module):
         # cosine similarity as logits
         logit_scale = self.logit_scale.exp()
         logits_per_image = logit_scale * image_features @ text_features.t()
-        logits_per_text = logits_per_image.t()
+        logits_per_text = logit_scale * text_features @ image_features.t()
 
         # shape = [global_batch_size, global_batch_size]
         return logits_per_image, logits_per_text
@@ -427,7 +387,7 @@ def convert_weights(model: nn.Module):
             if l.bias is not None:
                 l.bias.data = l.bias.data.half()
 
-        if isinstance(l, nn.MultiheadAttention):
+        if isinstance(l, MultiheadAttention):
             for attr in [*[f"{s}_proj_weight" for s in ["in", "q", "k", "v"]], "in_proj_bias", "bias_k", "bias_v"]:
                 tensor = getattr(l, attr)
                 if tensor is not None:
@@ -447,14 +407,12 @@ def build_model(state_dict: dict):
 
     if vit:
         vision_width = state_dict["visual.conv1.weight"].shape[0]
-        vision_layers = len(
-            [k for k in state_dict.keys() if k.startswith("visual.") and k.endswith(".attn.in_proj_weight")])
+        vision_layers = len([k for k in state_dict.keys() if k.startswith("visual.") and k.endswith(".attn.in_proj_weight")])
         vision_patch_size = state_dict["visual.conv1.weight"].shape[-1]
         grid_size = round((state_dict["visual.positional_embedding"].shape[0] - 1) ** 0.5)
         image_resolution = vision_patch_size * grid_size
     else:
-        counts: list = [len(set(k.split(".")[2] for k in state_dict if k.startswith(f"visual.layer{b}"))) for b in
-                        [1, 2, 3, 4]]
+        counts: list = [len(set(k.split(".")[2] for k in state_dict if k.startswith(f"visual.layer{b}"))) for b in [1, 2, 3, 4]]
         vision_layers = tuple(counts)
         vision_width = state_dict["visual.layer1.0.conv1.weight"].shape[0]
         output_width = round((state_dict["visual.attnpool.positional_embedding"].shape[0] - 1) ** 0.5)

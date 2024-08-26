@@ -2,8 +2,7 @@ import hashlib
 import os
 import urllib
 import warnings
-from typing import Any, Union, List
-from pkg_resources import packaging
+from typing import Union, List
 
 import torch
 from PIL import Image
@@ -12,17 +11,6 @@ from tqdm import tqdm
 
 from .model import build_model
 from .simple_tokenizer import SimpleTokenizer as _Tokenizer
-
-try:
-    from torchvision.transforms import InterpolationMode
-    BICUBIC = InterpolationMode.BICUBIC
-except ImportError:
-    BICUBIC = Image.BICUBIC
-
-
-if packaging.version.parse(torch.__version__) < packaging.version.parse("1.7.1"):
-    warnings.warn("PyTorch version 1.7.1 or higher is recommended")
-
 
 __all__ = ["available_models", "load", "tokenize"]
 _tokenizer = _Tokenizer()
@@ -38,8 +26,7 @@ _MODELS = {
     "ViT-L/14": "https://openaipublic.azureedge.net/clip/models/b8cca3fd41ae0c99ba7e8951adf17d267cdb84cd88be6f7c2e0eca1737a03836/ViT-L-14.pt",
 }
 
-
-def _download(url: str, root: str):
+def _download(url: str, root: str = os.path.expanduser("~/.cache/clip")):
     os.makedirs(root, exist_ok=True)
     filename = os.path.basename(url)
 
@@ -56,7 +43,7 @@ def _download(url: str, root: str):
             warnings.warn(f"{download_target} exists, but the SHA256 checksum does not match; re-downloading the file")
 
     with urllib.request.urlopen(url) as source, open(download_target, "wb") as output:
-        with tqdm(total=int(source.info().get("Content-Length")), ncols=80, unit='iB', unit_scale=True, unit_divisor=1024) as loop:
+        with tqdm(total=int(source.info().get("Content-Length")), ncols=80, unit='iB', unit_scale=True) as loop:
             while True:
                 buffer = source.read(8192)
                 if not buffer:
@@ -71,15 +58,11 @@ def _download(url: str, root: str):
     return download_target
 
 
-def _convert_image_to_rgb(image):
-    return image.convert("RGB")
-
-
 def _transform(n_px):
     return Compose([
-        Resize(n_px, interpolation=BICUBIC),
+        Resize(n_px, interpolation=Image.BICUBIC),
         CenterCrop(n_px),
-        _convert_image_to_rgb,
+        lambda image: image.convert("RGB"),
         ToTensor(),
         Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
     ])
@@ -90,7 +73,7 @@ def available_models() -> List[str]:
     return list(_MODELS.keys())
 
 
-def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_available() else "cpu", jit: bool = False, download_root: str = None):
+def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_available() else "cpu", jit=True):
     """Load a CLIP model
 
     Parameters
@@ -102,10 +85,7 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
         The device to put the loaded model
 
     jit : bool
-        Whether to load the optimized JIT model or more hackable non-JIT model (default).
-
-    download_root: str
-        path to download the model files; by default, it uses "~/.cache/clip"
+        Whether to load the optimized JIT model (default) or more hackable non-JIT model.
 
     Returns
     -------
@@ -116,7 +96,7 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
         A torchvision transform that converts a PIL image into a tensor that the returned model can take as its input
     """
     if name in _MODELS:
-        model_path = _download(_MODELS[name], download_root or os.path.expanduser("~/.cache/clip"))
+        model_path = _download(_MODELS[name])
     elif os.path.isfile(name):
         model_path = name
     else:
@@ -144,11 +124,7 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
     device_node = [n for n in device_holder.graph.findAllNodes("prim::Constant") if "Device" in repr(n)][-1]
 
     def patch_device(module):
-        try:
-            graphs = [module.graph] if hasattr(module, "graph") else []
-        except RuntimeError:
-            graphs = []
-
+        graphs = [module.graph] if hasattr(module, "graph") else []
         if hasattr(module, "forward1"):
             graphs.append(module.forward1.graph)
 
@@ -168,11 +144,7 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
         float_node = float_input.node()
 
         def patch_float(module):
-            try:
-                graphs = [module.graph] if hasattr(module, "graph") else []
-            except RuntimeError:
-                graphs = []
-
+            graphs = [module.graph] if hasattr(module, "graph") else []
             if hasattr(module, "forward1"):
                 graphs.append(module.forward1.graph)
 
@@ -192,7 +164,7 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
     return model, _transform(model.input_resolution.item())
 
 
-def tokenize(texts: Union[str, List[str]], context_length: int = 77, truncate: bool = False) -> torch.LongTensor:
+def tokenize(texts: Union[str, List[str]], context_length: int = 77) -> torch.LongTensor:
     """
     Returns the tokenized representation of given input string(s)
 
@@ -203,9 +175,6 @@ def tokenize(texts: Union[str, List[str]], context_length: int = 77, truncate: b
 
     context_length : int
         The context length to use; all CLIP models use 77 as the context length
-
-    truncate: bool
-        Whether to truncate the text in case its encoding is longer than the context length
 
     Returns
     -------
@@ -221,11 +190,7 @@ def tokenize(texts: Union[str, List[str]], context_length: int = 77, truncate: b
 
     for i, tokens in enumerate(all_tokens):
         if len(tokens) > context_length:
-            if truncate:
-                tokens = tokens[:context_length]
-                tokens[-1] = eot_token
-            else:
-                raise RuntimeError(f"Input {texts[i]} is too long for context length {context_length}")
+            raise RuntimeError(f"Input {texts[i]} is too long for context length {context_length}")
         result[i, :len(tokens)] = torch.tensor(tokens)
 
     return result
